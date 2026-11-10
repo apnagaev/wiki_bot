@@ -1,0 +1,5 @@
+inventory.yml
+vars/checklistbot.yml
+files/checklistbot/*.env
+__pycache__/
+.pytest_cache/

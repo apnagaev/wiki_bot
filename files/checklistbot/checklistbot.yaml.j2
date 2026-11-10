@@ -1,0 +1,31 @@
+# {{ ansible_managed }}
+services:
+  checklistbot:
+    build: ./app
+    image: checklistbot:local
+    container_name: checklistbot
+    restart: unless-stopped
+    env_file: checklistbot.env
+{% if checklistbot_dns | length %}
+    dns:
+{% for d in checklistbot_dns %}
+      - {{ d }}
+{% endfor %}
+{% endif %}
+    networks:
+      - checklistbot
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  checklistbot:
+    name: checklistbot
+{% if checklistbot_subnet %}
+    ipam:
+      config:
+        - subnet: {{ checklistbot_subnet }}
+{% endif %}

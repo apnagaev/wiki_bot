@@ -1,0 +1,28 @@
+# Скопируйте в vars/checklistbot.yml и зашифруйте: ansible-vault encrypt vars/checklistbot.yml
+
+# токен от @BotFather
+checklistbot_telegram_token: "123456789:AAAA..."
+# ключ шифрования API-ключей пользователей в базе (Fernet, 44 символа):
+#   openssl rand -base64 32 | tr '+/' '-_'
+# Не меняйте после запуска: сохранённые ключи станет нельзя расшифровать.
+checklistbot_secret_key: ""
+
+# какие вики принимать в ссылках (бот не ходит по чужим адресам)
+checklistbot_wiki_urls:
+  - https://wiki.example.com
+# пусто — бот открыт всем, у кого есть ключ к вики; иначе только эти Telegram ID
+checklistbot_allowed_tg_ids: []
+# если api.telegram.org недоступен напрямую: http://user:pass@proxy:3128 или socks5://…
+checklistbot_telegram_proxy: ""
+
+# PostgreSQL
+checklistbot_db_host: db.example.com
+checklistbot_db_port: 5432
+checklistbot_db_name: checklistbot
+checklistbot_db_user: checklistbot
+checklistbot_db_password: ""
+checklistbot_db_sslmode: prefer
+
+# DNS для контейнера (если вики резолвится только внутренним DNS) и подсеть Docker
+checklistbot_dns: []
+checklistbot_subnet: ""

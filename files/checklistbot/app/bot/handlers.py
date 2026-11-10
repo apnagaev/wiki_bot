@@ -1,0 +1,371 @@
+"""Telegram: подключение вики, показ списков, отметки."""
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import aiohttp
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           Message)
+
+from . import checklist as cl
+from .outline import (API_KEY_RE, AuthError, NotFound, Outline, OutlineError,
+                      parse_doc_link)
+from .storage import Storage, User
+
+log = logging.getLogger("checklistbot")
+
+PAGE_ROWS = 40          # строк с пунктами и заголовками на странице
+MAX_CHILDREN = 30       # вложенных списков в меню
+BTN_LEN = 60            # Telegram обрезает длинные кнопки сам, но так аккуратнее
+
+
+@dataclass
+class Config:
+    wiki_urls: list[str]
+    allowed_ids: set[int] = field(default_factory=set)
+
+
+def _cut(s: str, n: int = BTN_LEN) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _doc_key(doc: dict) -> str:
+    return doc.get("urlId") or doc["id"]
+
+
+def _progress(doc: dict) -> tuple[int, int]:
+    t = doc.get("tasks")
+    if isinstance(t, dict) and "total" in t:
+        return int(t.get("completed", 0)), int(t.get("total", 0))
+    return cl.progress(doc.get("text") or "")
+
+
+def build_view(doc: dict, kids: list[dict], *, hide: bool, page: int, is_root: bool,
+               web_url: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Сообщение и клавиатура для документа: его пункты + вложенные списки."""
+    key = _doc_key(doc)
+    entries = cl.parse(doc.get("text") or "")
+    its = cl.items(entries)
+    done = sum(1 for i in its if i.done)
+
+    shown: list[cl.Item | cl.Heading] = [e for e in entries
+                                         if not (hide and isinstance(e, cl.Item) and e.done)]
+    # заголовок без пунктов под ним не показываем
+    shown = [e for n, e in enumerate(shown)
+             if isinstance(e, cl.Item)
+             or any(isinstance(x, cl.Item) for x in _section(shown, n))]
+    pages = max(1, -(-len(shown) // PAGE_ROWS))
+    page = min(max(page, 0), pages - 1)
+    chunk = shown[page * PAGE_ROWS:(page + 1) * PAGE_ROWS]
+
+    lines = [f"<b>{html.escape(doc.get('title') or 'Без названия')}</b>"]
+    if its:
+        status = "🎉 всё отмечено" if done == len(its) else f"отмечено {done} из {len(its)}"
+        if hide and done:
+            status += " · отмеченные скрыты"
+        if pages > 1:
+            status += f" · стр. {page + 1}/{pages}"
+        lines.append(status)
+    elif kids:
+        lines.append("Выберите список")
+    else:
+        lines.append("Здесь нет пунктов. Пункт в вики — строка «- [ ] текст».")
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for e in chunk:
+        if isinstance(e, cl.Heading):
+            rows.append([InlineKeyboardButton(text=_cut(f"▸ {e.text}"), callback_data="n")])
+        else:
+            mark = "✅" if e.done else "⬜️"
+            pad = "↳ " * e.level
+            rows.append([InlineKeyboardButton(
+                text=_cut(f"{mark} {pad}{e.text}"),
+                callback_data=f"t|{key}|{e.index}|{e.key}|{page}")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"o|{key}|{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="n"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"o|{key}|{page + 1}"))
+        rows.append(nav)
+
+    for k in kids[:MAX_CHILDREN]:
+        d, t = _progress(k)
+        icon = "📁" if not t else ("✅" if d == t else "📋")
+        label = f"{icon} {k.get('title') or 'Без названия'}" + (f" · {d}/{t}" if t else "")
+        rows.append([InlineKeyboardButton(text=_cut(label), callback_data=f"o|{_doc_key(k)}|0")])
+
+    if its:
+        ctl = [InlineKeyboardButton(
+            text="👁 Показать все" if hide else "🙈 Скрыть отмеченные",
+            callback_data=f"h|{key}|{page}")]
+        if done:
+            ctl.append(InlineKeyboardButton(text="↺ Снять все", callback_data=f"r|{key}"))
+        rows.append(ctl)
+
+    bottom = []
+    parent = doc.get("parentDocumentId")
+    if not is_root and parent:
+        bottom.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"o|{parent}|0"))
+    bottom.append(InlineKeyboardButton(text="🔄", callback_data=f"o|{key}|{page}"))
+    bottom.append(InlineKeyboardButton(text="🌐 В вики", url=web_url))
+    rows.append(bottom)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _section(entries: list, n: int) -> list:
+    """Элементы под заголовком n до следующего заголовка того же или старшего уровня."""
+    head = entries[n]
+    if not isinstance(head, cl.Heading):
+        return []
+    out = []
+    for e in entries[n + 1:]:
+        if isinstance(e, cl.Heading) and e.level <= head.level:
+            break
+        out.append(e)
+    return out
+
+
+HELP = (
+    "Бот показывает чек-листы из вики и даёт отмечать пункты. "
+    "Отметки сохраняются прямо в документах вики, их видно и там.\n\n"
+    "<b>Как подключить</b>\n"
+    "1. Пришлите ссылку на свой раздел чек-листов в вики (документ, внутри которого лежат списки), "
+    "например <code>{example}/doc/checklists-…</code>. Пункт списка в вики — строка "
+    "«- [ ] текст» (чек-бокс).\n"
+    "2. Пришлите свой API-ключ вики: в вики «Настройки → API» → новый ключ, он начинается с "
+    "<code>ol_api_</code>. Сообщение с ключом бот сразу удалит, ключ хранится зашифрованным. "
+    "Бот видит в вики ровно то, что видите вы.\n\n"
+    "/lists — мои списки\n/setup — подключить заново\n/forget — удалить мои данные из бота"
+)
+
+
+class Handlers:
+    def __init__(self, storage: Storage, session: aiohttp.ClientSession, cfg: Config):
+        self.st = storage
+        self.http = session
+        self.cfg = cfg
+        self.pending: dict[int, dict] = defaultdict(dict)   # незавершённая настройка
+        self.doc_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.router = Router()
+        self.router.message.filter(F.chat.type == "private")
+        self._register()
+
+    # ---------- общее ----------
+
+    def allowed(self, uid: int) -> bool:
+        return not self.cfg.allowed_ids or uid in self.cfg.allowed_ids
+
+    def client(self, u: User) -> Outline:
+        return Outline(self.http, u.wiki_url, u.api_key)
+
+    async def view(self, u: User, doc_id: str, page: int = 0,
+                   doc: dict | None = None) -> tuple[str, InlineKeyboardMarkup]:
+        oc = self.client(u)
+        if doc is None:
+            doc = await oc.info(doc_id)
+        kids = await oc.children(doc["id"])
+        return build_view(doc, kids, hide=u.hide_done, page=page,
+                          is_root=doc["id"] == u.root_id, web_url=oc.web_url(doc))
+
+    @staticmethod
+    async def edit(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+        try:
+            await cb.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest as e:
+            if "not modified" not in str(e):
+                raise
+
+    @staticmethod
+    def error_text(e: Exception) -> str:
+        if isinstance(e, AuthError):
+            return "Вики не принимает ваш API-ключ (истёк или отозван). Пришлите новый ключ."
+        if isinstance(e, NotFound):
+            return "Документ не найден или к нему нет доступа."
+        return "Вики сейчас недоступна, попробуйте позже."
+
+    # ---------- команды и сообщения ----------
+
+    def _register(self) -> None:
+        r = self.router
+
+        @r.message(CommandStart())
+        @r.message(Command("help"))
+        async def start(m: Message):
+            if not self.allowed(m.from_user.id):
+                return await m.answer("Бот закрытый.")
+            u = await self.st.get(m.from_user.id)
+            if u and m.text.startswith("/start"):
+                return await self.send_root(m, u)
+            await m.answer(HELP.format(example=html.escape(self.cfg.wiki_urls[0])))
+
+        @r.message(Command("lists"))
+        async def lists(m: Message):
+            u = await self.st.get(m.from_user.id)
+            if not u:
+                return await m.answer(HELP.format(example=html.escape(self.cfg.wiki_urls[0])))
+            await self.send_root(m, u)
+
+        @r.message(Command("setup"))
+        async def setup(m: Message):
+            self.pending.pop(m.from_user.id, None)
+            await m.answer("Пришлите ссылку на раздел чек-листов и API-ключ вики "
+                           "(в любом порядке, можно одним сообщением). "
+                           "Если меняете только одно из двух — пришлите только его.")
+
+        @r.message(Command("forget"))
+        async def forget(m: Message):
+            self.pending.pop(m.from_user.id, None)
+            gone = await self.st.delete(m.from_user.id)
+            await m.answer("Ссылка и ключ удалены из бота. Сам ключ отзовите в вики: «Настройки → API»."
+                           if gone else "Данных о вас в боте нет.")
+
+        @r.message(F.text)
+        async def text(m: Message):
+            uid = m.from_user.id
+            if not self.allowed(uid):
+                return await m.answer("Бот закрытый.")
+            p = self.pending[uid]
+            km = API_KEY_RE.search(m.text)
+            link = parse_doc_link(m.text, self.cfg.wiki_urls)
+            if km:
+                p["key"] = km.group(0)
+                try:
+                    await m.delete()
+                except TelegramBadRequest:
+                    pass
+            if link:
+                p["link"] = link
+            if not km and not link:
+                if "/doc/" in m.text:
+                    return await m.answer("Принимаю ссылки только на вики: "
+                                          + ", ".join(self.cfg.wiki_urls))
+                self.pending.pop(uid, None)
+                return await m.answer("Не понял. /lists — списки, /help — как подключить.")
+            await self.try_setup(m, uid)
+
+    async def try_setup(self, m: Message, uid: int) -> None:
+        p = self.pending[uid]
+        old = await self.st.get(uid)
+        link = p.get("link") or (old and (old.wiki_url, old.root_id))
+        key = p.get("key") or (old and old.api_key)
+        if not link:
+            return await m.answer("Ключ получен ✅. Теперь пришлите ссылку на раздел чек-листов.")
+        if not key:
+            return await m.answer("Ссылка получена ✅. Теперь пришлите API-ключ вики "
+                                  "(«Настройки → API» → новый ключ).")
+        base, doc_id = link
+        oc = Outline(self.http, base, key)
+        try:
+            who = await oc.whoami()
+            root = await oc.info(doc_id)
+        except OutlineError as e:
+            if isinstance(e, AuthError):
+                p.pop("key", None)
+            elif isinstance(e, NotFound):
+                p.pop("link", None)
+            log.info("setup %s: %s", uid, e.__class__.__name__)
+            return await m.answer(self.error_text(e))
+        await self.st.save(uid, base, root["id"], root.get("title") or "", who, key)
+        self.pending.pop(uid, None)
+        log.info("user %s connected root %s", uid, root["id"])
+        await m.answer(f"Готово: {html.escape(who)}, раздел «{html.escape(root.get('title') or '')}».")
+        u = await self.st.get(uid)
+        await self.send_root(m, u)
+
+    async def send_root(self, m: Message, u: User) -> None:
+        try:
+            text, kb = await self.view(u, u.root_id)
+        except OutlineError as e:
+            return await m.answer(self.error_text(e))
+        await m.answer(text, reply_markup=kb)
+
+    # ---------- кнопки ----------
+
+    async def on_callback(self, cb: CallbackQuery) -> None:
+        data = (cb.data or "").split("|")
+        if data[0] == "n":
+            return await cb.answer()
+        u = await self.st.get(cb.from_user.id)
+        if not u or not self.allowed(cb.from_user.id):
+            return await cb.answer("Сначала подключите вики: /start", show_alert=True)
+        try:
+            await self._dispatch(cb, u, data)
+        except OutlineError as e:
+            log.info("callback %s %s: %s", cb.from_user.id, data[0], e)
+            await cb.answer(self.error_text(e), show_alert=True)
+
+    async def _dispatch(self, cb: CallbackQuery, u: User, data: list[str]) -> None:
+        op = data[0]
+        if op == "o":
+            text, kb = await self.view(u, data[1], int(data[2]))
+            await self.edit(cb, text, kb)
+            return await cb.answer()
+
+        if op == "h":
+            u.hide_done = not u.hide_done
+            await self.st.set_hide(u.tg_id, u.hide_done)
+            text, kb = await self.view(u, data[1], int(data[2]))
+            await self.edit(cb, text, kb)
+            return await cb.answer()
+
+        if op == "r":
+            doc = await self.client(u).info(data[1])
+            d, _ = _progress(doc)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"Да, снять ({d})", callback_data=f"R|{data[1]}"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"o|{data[1]}|0")]])
+            await self.edit(cb, f"Снять все отметки в «{html.escape(doc.get('title') or '')}»?", kb)
+            return await cb.answer()
+
+        if op in ("t", "R"):
+            oc = self.client(u)
+            async with self.doc_locks[data[1]]:        # быстрые нажатия подряд не теряются
+                doc = await oc.info(data[1])
+                text = doc.get("text") or ""
+                if op == "t":
+                    item = cl.find(text, int(data[2]), data[3])
+                    page = int(data[4])
+                    if item is None:
+                        v = await self.view(u, doc["id"], page, doc)
+                        await self.edit(cb, *v)
+                        return await cb.answer("Список изменился в вики — показываю актуальный.")
+                    new = cl.set_item(text, item, not item.done)
+                    toast = ("✅ " if not item.done else "⬜️ ") + _cut(item.text, 40)
+                else:
+                    page = 0
+                    new, n = cl.set_all(text, False)
+                    toast = f"Снято отметок: {n}"
+                saved = await oc.update_text(doc["id"], new)
+            doc = {**doc, **{k: v for k, v in saved.items() if k in ("text", "tasks", "updatedAt")}}
+            doc["text"] = new
+            doc.pop("tasks", None)          # прогресс пересчитаем по тексту
+            v = await self.view(u, doc["id"], page, doc)
+            await self.edit(cb, *v)
+            return await cb.answer(toast)
+
+        await cb.answer()
+
+
+def setup_router(h: Handlers) -> Router:
+    h.router.callback_query.register(h.on_callback)
+    return h.router
+
+
+async def set_commands(bot: Bot) -> None:
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="lists", description="Мои списки"),
+        BotCommand(command="setup", description="Подключить вики заново"),
+        BotCommand(command="forget", description="Удалить мои данные"),
+        BotCommand(command="help", description="Как подключить"),
+    ])
