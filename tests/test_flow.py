@@ -26,6 +26,7 @@ DOCS = {
     "secret-uuid": {"id": "secret-uuid", "urlId": "SeCrEt0001", "title": "Чужое", "text": "", "parentDocumentId": None, "url": "/doc/x-SeCrEt0001", "deny": True},
 }
 UPDATES = []
+OLD_SERVER = False   # Outline без editMode: любой update заменяет текст
 
 
 def find(i):
@@ -51,7 +52,13 @@ async def api(req):
         d = find(body["id"])
         if d.get("deny"):
             return web.json_response({}, status=404)
-        d["text"] = d["text"] + body["text"] if body.get("append") else body["text"]
+        mode = body.get("editMode") if not OLD_SERVER else None
+        if mode == "prepend":
+            d["text"] = body["text"] + d["text"]
+        elif mode == "append":
+            d["text"] = d["text"] + body["text"]
+        else:
+            d["text"] = body["text"]
         UPDATES.append(body["id"])
         return web.json_response({"data": dict(d)})
     return web.json_response({}, status=400)
@@ -172,19 +179,21 @@ async def main():
         await h.on_text(c.msg("просто текст"))                      # не ссылка — переспросит
         assert "Нужна ссылка" in c.out[-1][0]
         await h.on_text(c.msg(f"{BASE}/doc/zametki-NoTeS00001"))
-        assert "в конец «Заметки»" in c.out[-2][0] and "напишите заметку" in c.out[-1][0]
+        assert "в начало «Заметки»" in c.out[-2][0] and "напишите заметку" in c.out[-1][0]
         before = datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0)
         await h.on_text(c.msg(f"Купить молоко\n+++\nи хлеб {BASE}/doc/x-SeCrEt0001"))   # ссылка внутри — это текст заметки
         t = DOCS["notes-uuid"]["text"]
-        m = re.search(r"\n\n\+\+\+\n## (\d{4}\.\d\d\.\d\d \d\d:\d\d:\d\d)\nКупить молоко\n\\\+\+\+\nи хлеб .*\n\+\+\+\n$", t)
+        m = re.match(r"\+\+\+\n## (\d{4}\.\d\d\.\d\d \d\d:\d\d:\d\d)\nКупить молоко\n\\\+\+\+\nи хлеб .*\n\+\+\+\n\nМои заметки$", t)
         assert m, t
         stamp = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S").replace(tzinfo=ZoneInfo("Europe/Moscow"))
         assert 0 <= (stamp - before).total_seconds() < 5            # время московское
-        assert t.startswith("Мои заметки") and c.out[-1][0].startswith("📝 Сохранено в «Заметки»")
+        assert c.out[-1][0].startswith("📝 Сохранено в «Заметки»")
         assert len((await st.get(1)).roots) == 1                     # ссылка не стала разделом
         # /note текст — сразу, без вопросов; кнопка «Ещё заметка»
         await h.start_note(c.msg("/note"), 1, "вторая")
-        assert DOCS["notes-uuid"]["text"].endswith("\nвторая\n+++\n")
+        t2 = DOCS["notes-uuid"]["text"]
+        assert t2.startswith("+++\n## ") and t2.index("\nвторая\n") < t2.index("Купить молоко")   # новая — сверху
+        assert t2.endswith("Мои заметки")
         await h.on_callback(c.cb("N")); assert "Напишите заметку" in c.out[-1][0]
         # ключ во время ожидания заметки — не попадает в заметку
         n = len(DOCS["notes-uuid"]["text"])
@@ -198,8 +207,15 @@ async def main():
         assert "недоступна" in c.out[-1][0]
         DOCS["fam-uuid"]["text"] = "Семейное"
         await h.on_text(c.msg(f"{BASE}/doc/semya-FaMiLy0001"))
-        assert DOCS["fam-uuid"]["text"].endswith("\npotерянная\n+++\n".replace("potерянная", "потерянная"))
+        assert DOCS["fam-uuid"]["text"].endswith("\nпотерянная\n+++\n\nСемейное")
         assert (await st.get(1)).notes_title == "Семья и дача"
+        # старый Outline без editMode заменил бы документ — бот возвращает старый текст под заметкой
+        global OLD_SERVER
+        OLD_SERVER = True
+        await h.start_note(c.msg("/note"), 1, "на старом сервере")
+        OLD_SERVER = False
+        t3 = DOCS["fam-uuid"]["text"]
+        assert t3.startswith("+++\n## ") and "\nна старом сервере\n" in t3 and t3.endswith("\nпотерянная\n+++\n\nСемейное"), t3
         # /cancel
         await h.on_text(c.msg(NOTE_BTN)); h.pending.pop(1, None)
         await h.on_text(c.msg("что-то"))

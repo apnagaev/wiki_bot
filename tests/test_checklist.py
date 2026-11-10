@@ -80,4 +80,14 @@ def test_note_markdown():
     now = datetime(2026, 11, 10, 9, 5, 7)
     assert stamp(now) == "2026.11.10 09:05:07"
     md = note_markdown("строка\n+++\n  ++++  \nконец\n", now)
-    assert md == "\n\n+++\n## 2026.11.10 09:05:07\nстрока\n\\+++\n\\  ++++  \nконец\n+++\n"
+    assert md == "+++\n## 2026.11.10 09:05:07\nстрока\n\\+++\n\\  ++++  \nконец\n+++\n\n"
+
+
+def test_looks_replaced():
+    from bot.notes import looks_replaced
+    md = "+++\n## 2026.11.10 09:05:07\nтекст\n+++\n\n"
+    old = "Старые заметки\n\n+++++\n## 2026.11.09 10:00:00\n\nпрошлая\n\n+++++\n"
+    exported = md.replace("+++", "+++++").replace("\nтекст", "\n\nтекст") + old
+    assert not looks_replaced(old, exported, md)          # настоящий prepend
+    assert looks_replaced(old, md.replace("+++", "+++++"), md)  # сервер заменил документ
+    assert not looks_replaced("", md, md) and not looks_replaced(old, None, md)
