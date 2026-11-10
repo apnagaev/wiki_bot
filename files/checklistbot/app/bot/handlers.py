@@ -17,7 +17,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from . import checklist as cl
 from .outline import (API_KEY_RE, AuthError, NotFound, Outline, OutlineError,
                       parse_doc_link)
-from .storage import Storage, User
+from .storage import MAX_ROOTS, Storage, User
 
 log = logging.getLogger("checklistbot")
 
@@ -114,7 +114,9 @@ def build_view(doc: dict, kids: list[dict], *, hide: bool, page: int, is_root: b
 
     bottom = []
     parent = doc.get("parentDocumentId")
-    if not is_root and parent:
+    if is_root:
+        bottom.append(InlineKeyboardButton(text="📚 Разделы", callback_data="m"))
+    elif parent:
         bottom.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"o|{parent}|0"))
     bottom.append(InlineKeyboardButton(text="🔄", callback_data=f"o|{key}|{page}"))
     bottom.append(InlineKeyboardButton(text="🌐 В вики", url=web_url))
@@ -139,14 +141,38 @@ HELP = (
     "Бот показывает чек-листы из вики и даёт отмечать пункты. "
     "Отметки сохраняются прямо в документах вики, их видно и там.\n\n"
     "<b>Как подключить</b>\n"
-    "1. Пришлите ссылку на свой раздел чек-листов в вики (документ, внутри которого лежат списки), "
+    "1. Пришлите ссылку на раздел чек-листов в вики (документ, внутри которого лежат списки), "
     "например <code>{example}/doc/checklists-…</code>. Пункт списка в вики — строка "
     "«- [ ] текст» (чек-бокс).\n"
     "2. Пришлите свой API-ключ вики: в вики «Настройки → API» → новый ключ, он начинается с "
     "<code>ol_api_</code>. Сообщение с ключом бот сразу удалит, ключ хранится зашифрованным. "
     "Бот видит в вики ровно то, что видите вы.\n\n"
-    "/lists — мои списки\n/setup — подключить заново\n/forget — удалить мои данные из бота"
+    "Разделов может быть несколько (свои, семейные, рабочие): чтобы добавить ещё один, "
+    "просто пришлите ссылку на него.\n\n"
+    "/lists — мои списки\n/sections — разделы: добавить, убрать\n"
+    "/setup — сменить ключ\n/forget — удалить мои данные из бота"
 )
+
+ADD_HINT = ("Чтобы добавить раздел, пришлите ссылку на него: откройте документ-раздел в вики "
+            "и скопируйте адрес вида <code>{example}/doc/…</code>.")
+
+
+def sections_view(u: User) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[InlineKeyboardButton(text=_cut(f"📁 {r.title or 'Без названия'}"),
+                                  callback_data=f"o|{r.id}|0")] for r in u.roots]
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="a")]
+                + ([InlineKeyboardButton(text="✖️ Убрать", callback_data="s")] if u.roots else []))
+    text = "<b>Мои разделы</b>\n" + ("Выберите раздел" if u.roots else
+                                     "Разделов нет. Пришлите ссылку на раздел чек-листов в вики.")
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def remove_view(u: User) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[InlineKeyboardButton(text=_cut(f"✖️ {r.title or 'Без названия'}"),
+                                  callback_data=f"d|{r.id}")] for r in u.roots]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="m")])
+    return ("Какой раздел убрать из бота? В вики ничего не удаляется.",
+            InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 class Handlers:
@@ -162,6 +188,10 @@ class Handlers:
 
     # ---------- общее ----------
 
+    @property
+    def example(self) -> str:
+        return html.escape(self.cfg.wiki_urls[0])
+
     def allowed(self, uid: int) -> bool:
         return not self.cfg.allowed_ids or uid in self.cfg.allowed_ids
 
@@ -174,8 +204,11 @@ class Handlers:
         if doc is None:
             doc = await oc.info(doc_id)
         kids = await oc.children(doc["id"])
+        is_root = u.is_root(doc["id"])
+        if is_root and doc.get("title"):
+            await self.st.rename_root(u.tg_id, doc["id"], doc["title"])   # переименовали в вики
         return build_view(doc, kids, hide=u.hide_done, page=page,
-                          is_root=doc["id"] == u.root_id, web_url=oc.web_url(doc))
+                          is_root=is_root, web_url=oc.web_url(doc))
 
     @staticmethod
     async def edit(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
@@ -204,70 +237,90 @@ class Handlers:
             if not self.allowed(m.from_user.id):
                 return await m.answer("Бот закрытый.")
             u = await self.st.get(m.from_user.id)
-            if u and m.text.startswith("/start"):
-                return await self.send_root(m, u)
-            await m.answer(HELP.format(example=html.escape(self.cfg.wiki_urls[0])))
+            if u and u.roots and m.text.startswith("/start"):
+                return await self.send_lists(m, u)
+            await m.answer(HELP.format(example=self.example))
 
         @r.message(Command("lists"))
         async def lists(m: Message):
             u = await self.st.get(m.from_user.id)
             if not u:
-                return await m.answer(HELP.format(example=html.escape(self.cfg.wiki_urls[0])))
-            await self.send_root(m, u)
+                return await m.answer(HELP.format(example=self.example))
+            await self.send_lists(m, u)
+
+        @r.message(Command("sections"))
+        async def sections(m: Message):
+            u = await self.st.get(m.from_user.id)
+            if not u:
+                return await m.answer(HELP.format(example=self.example))
+            text, kb = sections_view(u)
+            await m.answer(text, reply_markup=kb)
 
         @r.message(Command("setup"))
         async def setup(m: Message):
             self.pending.pop(m.from_user.id, None)
-            await m.answer("Пришлите ссылку на раздел чек-листов и API-ключ вики "
-                           "(в любом порядке, можно одним сообщением). "
-                           "Если меняете только одно из двух — пришлите только его.")
+            await m.answer("Пришлите новый API-ключ вики — он заменит старый, разделы останутся. "
+                           "Новый раздел добавляется просто ссылкой на него, убрать — /sections.")
 
         @r.message(Command("forget"))
         async def forget(m: Message):
             self.pending.pop(m.from_user.id, None)
             gone = await self.st.delete(m.from_user.id)
-            await m.answer("Ссылка и ключ удалены из бота. Сам ключ отзовите в вики: «Настройки → API»."
+            await m.answer("Разделы и ключ удалены из бота. Сам ключ отзовите в вики: «Настройки → API»."
                            if gone else "Данных о вас в боте нет.")
 
         @r.message(F.text)
         async def text(m: Message):
-            uid = m.from_user.id
-            if not self.allowed(uid):
-                return await m.answer("Бот закрытый.")
-            p = self.pending[uid]
-            km = API_KEY_RE.search(m.text)
-            link = parse_doc_link(m.text, self.cfg.wiki_urls)
-            if km:
-                p["key"] = km.group(0)
-                try:
-                    await m.delete()
-                except TelegramBadRequest:
-                    pass
-            if link:
-                p["link"] = link
-            if not km and not link:
-                if "/doc/" in m.text:
-                    return await m.answer("Принимаю ссылки только на вики: "
-                                          + ", ".join(self.cfg.wiki_urls))
-                self.pending.pop(uid, None)
-                return await m.answer("Не понял. /lists — списки, /help — как подключить.")
-            await self.try_setup(m, uid)
+            await self.on_text(m)
+
+    async def on_text(self, m: Message) -> None:
+        uid = m.from_user.id
+        if not self.allowed(uid):
+            return await m.answer("Бот закрытый.")
+        p = self.pending[uid]
+        km = API_KEY_RE.search(m.text)
+        link = parse_doc_link(m.text, self.cfg.wiki_urls)
+        if km:
+            p["key"] = km.group(0)
+            try:
+                await m.delete()
+            except TelegramBadRequest:
+                pass
+        if link:
+            p["link"] = link
+        if not km and not link:
+            if "/doc/" in m.text:
+                return await m.answer("Принимаю ссылки только на вики: "
+                                      + ", ".join(self.cfg.wiki_urls))
+            self.pending.pop(uid, None)
+            return await m.answer("Не понял. /lists — списки, /help — как подключить.")
+        await self.try_setup(m, uid)
 
     async def try_setup(self, m: Message, uid: int) -> None:
+        """Ссылка добавляет раздел, ключ заменяет ключ. Порядок любой."""
         p = self.pending[uid]
         old = await self.st.get(uid)
-        link = p.get("link") or (old and (old.wiki_url, old.root_id))
-        key = p.get("key") or (old and old.api_key)
-        if not link:
-            return await m.answer("Ключ получен ✅. Теперь пришлите ссылку на раздел чек-листов.")
+        link = p.get("link")
+        key = p.get("key") or (old.api_key if old else None)
+        base = link[0] if link else (old.wiki_url if old else None)
+
+        if old and old.roots and link and base != old.wiki_url:
+            self.pending.pop(uid, None)
+            return await m.answer("Ваши разделы подключены из другой вики. Разделы из разных вики "
+                                  "одновременно не поддерживаются: сначала /forget.")
         if not key:
             return await m.answer("Ссылка получена ✅. Теперь пришлите API-ключ вики "
                                   "(«Настройки → API» → новый ключ).")
-        base, doc_id = link
+        if not base:
+            return await m.answer("Ключ получен ✅. Теперь пришлите ссылку на раздел чек-листов.")
+        if link and old and not old.is_root(link[1]) and len(old.roots) >= MAX_ROOTS:
+            self.pending.pop(uid, None)
+            return await m.answer(f"Подключено максимум разделов ({MAX_ROOTS}). Уберите лишние: /sections.")
+
         oc = Outline(self.http, base, key)
         try:
             who = await oc.whoami()
-            root = await oc.info(doc_id)
+            root = await oc.info(link[1]) if link else None
         except OutlineError as e:
             if isinstance(e, AuthError):
                 p.pop("key", None)
@@ -275,18 +328,40 @@ class Handlers:
                 p.pop("link", None)
             log.info("setup %s: %s", uid, e.__class__.__name__)
             return await m.answer(self.error_text(e))
-        await self.st.save(uid, base, root["id"], root.get("title") or "", who, key)
-        self.pending.pop(uid, None)
-        log.info("user %s connected root %s", uid, root["id"])
-        await m.answer(f"Готово: {html.escape(who)}, раздел «{html.escape(root.get('title') or '')}».")
-        u = await self.st.get(uid)
-        await self.send_root(m, u)
 
-    async def send_root(self, m: Message, u: User) -> None:
+        await self.st.save_user(uid, base, who, key)
+        self.pending.pop(uid, None)
+        notes = []
+        if p.get("key") and old:
+            notes.append("Ключ обновлён ✅")
+        if root:
+            title = html.escape(root.get("title") or "")
+            if await self.st.add_root(uid, root["id"], root.get("title") or ""):
+                log.info("user %s added root %s", uid, root["id"])
+                notes.append(f"Раздел «{title}» подключён ✅")
+            else:
+                notes.append(f"Раздел «{title}» уже был подключён")
+        elif not old:
+            notes.append("Ключ получен ✅. Теперь пришлите ссылку на раздел чек-листов.")
+        await m.answer(f"{html.escape(who)}: " + ". ".join(notes))
+
+        u = await self.st.get(uid)
+        if root:
+            await self.send_doc(m, u, root["id"], root)
+        elif u.roots:
+            await self.send_lists(m, u)
+
+    async def send_doc(self, m: Message, u: User, doc_id: str, doc: dict | None = None) -> None:
         try:
-            text, kb = await self.view(u, u.root_id)
+            text, kb = await self.view(u, doc_id, doc=doc)
         except OutlineError as e:
             return await m.answer(self.error_text(e))
+        await m.answer(text, reply_markup=kb)
+
+    async def send_lists(self, m: Message, u: User) -> None:
+        if len(u.roots) == 1:
+            return await self.send_doc(m, u, u.roots[0].id)
+        text, kb = sections_view(u)
         await m.answer(text, reply_markup=kb)
 
     # ---------- кнопки ----------
@@ -306,6 +381,35 @@ class Handlers:
 
     async def _dispatch(self, cb: CallbackQuery, u: User, data: list[str]) -> None:
         op = data[0]
+        if op == "m":
+            await self.edit(cb, *sections_view(u))
+            return await cb.answer()
+
+        if op == "a":
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="m")]])
+            await self.edit(cb, ADD_HINT.format(example=self.example), kb)
+            return await cb.answer()
+
+        if op == "s":
+            await self.edit(cb, *remove_view(u))
+            return await cb.answer()
+
+        if op == "d":
+            title = next((r.title for r in u.roots if r.id == data[1]), "")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Да, убрать", callback_data=f"D|{data[1]}"),
+                InlineKeyboardButton(text="Отмена", callback_data="s")]])
+            await self.edit(cb, f"Убрать раздел «{html.escape(title)}» из бота? "
+                                "Документы в вики останутся как есть.", kb)
+            return await cb.answer()
+
+        if op == "D":
+            await self.st.remove_root(u.tg_id, data[1])
+            u.roots = [r for r in u.roots if r.id != data[1]]
+            await self.edit(cb, *sections_view(u))
+            return await cb.answer("Раздел убран")
+
         if op == "o":
             text, kb = await self.view(u, data[1], int(data[2]))
             await self.edit(cb, text, kb)
@@ -345,9 +449,8 @@ class Handlers:
                     page = 0
                     new, n = cl.set_all(text, False)
                     toast = f"Снято отметок: {n}"
-                saved = await oc.update_text(doc["id"], new)
-            doc = {**doc, **{k: v for k, v in saved.items() if k in ("text", "tasks", "updatedAt")}}
-            doc["text"] = new
+                await oc.update_text(doc["id"], new)
+            doc = {**doc, "text": new}
             doc.pop("tasks", None)          # прогресс пересчитаем по тексту
             v = await self.view(u, doc["id"], page, doc)
             await self.edit(cb, *v)
@@ -365,7 +468,8 @@ async def set_commands(bot: Bot) -> None:
     from aiogram.types import BotCommand
     await bot.set_my_commands([
         BotCommand(command="lists", description="Мои списки"),
-        BotCommand(command="setup", description="Подключить вики заново"),
+        BotCommand(command="sections", description="Разделы: добавить, убрать"),
+        BotCommand(command="setup", description="Сменить ключ API"),
         BotCommand(command="forget", description="Удалить мои данные"),
         BotCommand(command="help", description="Как подключить"),
     ])

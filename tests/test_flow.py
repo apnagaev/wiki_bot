@@ -1,21 +1,32 @@
-import asyncio, sys, pathlib, types
+"""Сценарий целиком: имитация API Outline + настоящий PostgreSQL.
+
+Запуск: PGHOST=… PGPORT=… PGUSER=… PGDATABASE=… python3 tests/test_flow.py
+(база очищается: таблицы checklist_* пересоздаются).
+"""
+import asyncio, os, sys, pathlib, types
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "files/checklistbot/app"))
-import aiohttp
+import aiohttp, asyncpg
 from aiohttp import web
+from cryptography.fernet import Fernet
 from bot.handlers import Handlers, Config
-from bot.storage import User
+from bot.storage import Storage
 from bot import checklist as cl
 
 KEY = "ol_api_" + "x" * 38
+BASE = "http://127.0.0.1:8765"
 DOCS = {
     "root-uuid": {"id": "root-uuid", "urlId": "tE5hSY73Kc", "title": "Checklists", "text": "", "parentDocumentId": None, "url": "/doc/checklists-tE5hSY73Kc"},
     "trip-uuid": {"id": "trip-uuid", "urlId": "SMQWdQQqCa", "title": "Travel list", "parentDocumentId": "root-uuid", "url": "/doc/travel-list-SMQWdQQqCa",
                   "text": "# Всегда\n\n" + "\n".join(f"- [ ] вещь {i}" for i in range(8)) + "\n\n\\"},
+    "fam-uuid": {"id": "fam-uuid", "urlId": "FaMiLy0001", "title": "Семья", "text": "- [ ] молоко", "parentDocumentId": None, "url": "/doc/semya-FaMiLy0001"},
+    "secret-uuid": {"id": "secret-uuid", "urlId": "SeCrEt0001", "title": "Чужое", "text": "", "parentDocumentId": None, "url": "/doc/x-SeCrEt0001", "deny": True},
 }
 UPDATES = []
 
+
 def find(i):
     return next((d for d in DOCS.values() if i in (d["id"], d["urlId"])), None)
+
 
 async def api(req):
     if req.headers.get("Authorization") != f"Bearer {KEY}":
@@ -26,7 +37,9 @@ async def api(req):
         return web.json_response({"data": {"user": {"name": "Aleksandr"}}})
     if m == "documents.info":
         d = find(body["id"])
-        return web.json_response({"data": dict(d)}) if d else web.json_response({}, status=404)
+        if not d or d.get("deny"):
+            return web.json_response({}, status=404)
+        return web.json_response({"data": dict(d)})
     if m == "documents.list":
         kids = [dict(d) for d in DOCS.values() if d["parentDocumentId"] == body["parentDocumentId"]]
         return web.json_response({"data": kids})
@@ -35,61 +48,126 @@ async def api(req):
         return web.json_response({"data": dict(d)})
     return web.json_response({}, status=400)
 
-class St:
-    def __init__(s, u): s.u = u
-    async def get(s, _): return s.u
-    async def set_hide(s, _, h): s.u.hide_done = h
 
-class Msg:
-    def __init__(s): s.edits = []
-    async def edit_text(s, text, reply_markup=None): s.edits.append((text, reply_markup))
+class Chat:
+    """Личный чат: ответы бота и правки сообщения с кнопками."""
+    def __init__(s): s.out = []; s.edits = []; s.deleted = 0
 
-def cb(data, msg):
-    toasts = []
-    async def answer(t=None, show_alert=False): toasts.append(t)
-    return types.SimpleNamespace(data=data, message=msg, from_user=types.SimpleNamespace(id=1), answer=answer, toasts=toasts)
+    def msg(s, text):
+        async def answer(t, reply_markup=None): s.out.append((t, reply_markup))
+        async def delete(): s.deleted += 1
+        return types.SimpleNamespace(text=text, from_user=types.SimpleNamespace(id=1), answer=answer, delete=delete)
+
+    def cb(s, data):
+        toasts = []
+        async def edit_text(t, reply_markup=None): s.edits.append((t, reply_markup))
+        async def answer(t=None, show_alert=False): toasts.append(t)
+        return types.SimpleNamespace(data=data, message=types.SimpleNamespace(edit_text=edit_text),
+                                     from_user=types.SimpleNamespace(id=1), answer=answer, toasts=toasts)
+
+
+def labels(kb):
+    return [b.text for r in kb.inline_keyboard for b in r]
+
+
+def cbs(kb):
+    return {b.text: b.callback_data for r in kb.inline_keyboard for b in r}
+
 
 async def main():
     app = web.Application(); app.router.add_post("/api/{m}", api)
     runner = web.AppRunner(app); await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 8765); await site.start()
-    base = "http://127.0.0.1:8765"
-    u = User(1, base, "root-uuid", "Checklists", "A", KEY, False)
+    await web.TCPSite(runner, "127.0.0.1", 8765).start()
+    pool = await asyncpg.create_pool(min_size=1, max_size=4)
+    await pool.execute("DROP TABLE IF EXISTS checklist_roots, checklist_users")
+    st = Storage(pool, Fernet.generate_key().decode()); await st.init()
+    c = Chat()
     async with aiohttp.ClientSession() as http:
-        h = Handlers(St(u), http, Config([base]))
-        msg = Msg()
-        # корень: кнопка списка с прогрессом
-        await h.on_callback(cb("o|root-uuid|0", msg))
-        labels = [b.text for r in msg.edits[-1][1].inline_keyboard for b in r]
-        assert "📋 Travel list · 0/8" in labels, labels
-        # открыть список и быстро отметить 5 пунктов параллельно
-        await h.on_callback(cb("o|SMQWdQQqCa|0", msg))
+        h = Handlers(st, http, Config([BASE]))
+
+        # подключение: ссылка, потом ключ
+        await h.on_text(c.msg(f"вот {BASE}/doc/checklists-tE5hSY73Kc"))
+        assert "пришлите API-ключ" in c.out[-1][0]
+        await h.on_text(c.msg(KEY))
+        assert c.deleted == 1
+        assert "Раздел «Checklists» подключён" in c.out[-2][0], c.out
+        assert "📋 Travel list · 0/8" in labels(c.out[-1][1]) and "📚 Разделы" in labels(c.out[-1][1])
+
+        # один раздел: /lists сразу открывает его
+        u = await st.get(1); await h.send_lists(c.msg("/lists"), u)
+        assert c.out[-1][0].startswith("<b>Checklists</b>")
+
+        # второй раздел — одной ссылкой, ключ не нужен
+        await h.on_text(c.msg(f"{BASE}/doc/semya-FaMiLy0001"))
+        assert "Раздел «Семья» подключён" in c.out[-2][0]
+        assert "⬜️ молоко" in labels(c.out[-1][1]) and "📚 Разделы" in labels(c.out[-1][1])
+        await h.on_text(c.msg(f"{BASE}/doc/semya-FaMiLy0001"))
+        assert "уже был подключён" in c.out[-2][0]
+
+        # нет доступа — раздел не добавляется
+        await h.on_text(c.msg(f"{BASE}/doc/x-SeCrEt0001"))
+        assert "нет доступа" in c.out[-1][0]
+        # чужая вики
+        await h.on_text(c.msg("https://evil.example/doc/x-SeCrEt0001"))
+        assert "только на вики" in c.out[-1][0]
+
+        # несколько разделов: /lists — меню разделов
+        u = await st.get(1); await h.send_lists(c.msg("/lists"), u)
+        assert labels(c.out[-1][1]) == ["📁 Checklists", "📁 Семья", "➕ Добавить", "✖️ Убрать"]
+
+        # список: параллельные отметки не теряются
+        await h.on_callback(c.cb("o|SMQWdQQqCa|0"))
         its = cl.items(cl.parse(DOCS["trip-uuid"]["text"]))
-        cbs = [cb(f"t|SMQWdQQqCa|{i.index}|{i.key}|0", msg) for i in its[:5]]
-        await asyncio.gather(*(h.on_callback(c) for c in cbs))
-        assert cl.progress(DOCS["trip-uuid"]["text"]) == (5, 8), DOCS["trip-uuid"]["text"]
+        await asyncio.gather(*(h.on_callback(c.cb(f"t|SMQWdQQqCa|{i.index}|{i.key}|0")) for i in its[:5]))
+        assert cl.progress(DOCS["trip-uuid"]["text"]) == (5, 8)
         assert DOCS["trip-uuid"]["text"].endswith("\n\n\\")
-        assert "отмечено 5 из 8" in msg.edits[-1][0] and "⬅️ Назад" in [b.text for r in msg.edits[-1][1].inline_keyboard for b in r]
-        # снять отметку
-        await h.on_callback(cb(f"t|SMQWdQQqCa|0|{its[0].key}|0", msg))
-        assert cl.progress(DOCS["trip-uuid"]["text"]) == (4, 8)
-        # скрыть отмеченные
-        await h.on_callback(cb("h|SMQWdQQqCa|0", msg))
-        assert u.hide_done and "скрыты" in msg.edits[-1][0]
-        # снять все
-        await h.on_callback(cb("r|SMQWdQQqCa", msg)); await h.on_callback(cb("R|SMQWdQQqCa", msg))
+        assert "отмечено 5 из 8" in c.edits[-1][0] and "⬅️ Назад" in labels(c.edits[-1][1])
+        # «Назад» из списка ведёт в раздел, из раздела — «Разделы»
+        await h.on_callback(c.cb(cbs(c.edits[-1][1])["⬅️ Назад"]))
+        assert c.edits[-1][0].startswith("<b>Checklists</b>") and "📋 Travel list · 5/8" in labels(c.edits[-1][1])
+        await h.on_callback(c.cb("m"))
+        assert "Мои разделы" in c.edits[-1][0]
+
+        # скрыть отмеченные, снять все
+        await h.on_callback(c.cb("h|SMQWdQQqCa|0"))
+        assert (await st.get(1)).hide_done and "скрыты" in c.edits[-1][0]
+        await h.on_callback(c.cb("r|SMQWdQQqCa")); await h.on_callback(c.cb("R|SMQWdQQqCa"))
         assert cl.progress(DOCS["trip-uuid"]["text"]) == (0, 8)
-        # пункт удалили в вики — бот не отмечает чужой пункт
+
+        # пункт удалили в вики — бот не отмечает другой пункт
         stale = cl.items(cl.parse(DOCS["trip-uuid"]["text"]))[7]
         DOCS["trip-uuid"]["text"] = DOCS["trip-uuid"]["text"].replace("- [ ] вещь 7\n", "")
-        c = cb(f"t|SMQWdQQqCa|7|{stale.key}|0", msg); n = len(UPDATES)
-        await h.on_callback(c)
-        assert len(UPDATES) == n and "изменился" in c.toasts[-1]
-        # плохой ключ
-        u.api_key = "ol_api_bad"
-        c = cb("o|SMQWdQQqCa|0", msg); await h.on_callback(c)
-        assert "ключ" in c.toasts[-1]
-    await runner.cleanup()
+        cb = c.cb(f"t|SMQWdQQqCa|7|{stale.key}|0"); n = len(UPDATES)
+        await h.on_callback(cb)
+        assert len(UPDATES) == n and "изменился" in cb.toasts[-1]
+
+        # раздел переименовали в вики — название в меню обновится
+        DOCS["fam-uuid"]["title"] = "Семья и дача"
+        await h.on_callback(c.cb("o|fam-uuid|0")); await h.on_callback(c.cb("m"))
+        assert "📁 Семья и дача" in labels(c.edits[-1][1])
+
+        # убрать раздел
+        await h.on_callback(c.cb("s")); await h.on_callback(c.cb("d|fam-uuid"))
+        assert "Семья и дача" in c.edits[-1][0]
+        cb = c.cb("D|fam-uuid"); await h.on_callback(cb)
+        assert labels(c.edits[-1][1]) == ["📁 Checklists", "➕ Добавить", "✖️ Убрать"] and cb.toasts[-1] == "Раздел убран"
+        assert "Семья" in DOCS["fam-uuid"]["title"]          # в вики ничего не тронуто
+
+        # смена ключа: разделы остаются
+        await h.on_text(c.msg(KEY))
+        assert "Ключ обновлён" in c.out[-2][0] and len((await st.get(1)).roots) == 1
+
+        # плохой ключ в базе
+        await pool.execute("UPDATE checklist_users SET api_key=$1", st.f.encrypt(b"ol_api_bad"))
+        cb = c.cb("o|SMQWdQQqCa|0"); await h.on_callback(cb)
+        assert "ключ" in cb.toasts[-1]
+
+    await pool.execute("DROP TABLE checklist_roots, checklist_users")
+    await pool.close(); await runner.cleanup()
     print("flow ok, updates:", len(UPDATES))
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    if not os.environ.get("PGHOST"):
+        sys.exit("нужен PostgreSQL: задайте PGHOST, PGPORT, PGUSER, PGDATABASE")
+    asyncio.run(main())
