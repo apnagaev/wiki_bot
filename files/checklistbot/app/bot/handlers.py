@@ -161,7 +161,7 @@ HELP = (
     "Разделов может быть несколько (свои, семейные, рабочие): чтобы добавить ещё один, "
     "просто пришлите ссылку на него.\n\n"
     "<b>Быстрые заметки</b>: кнопка «📝 Заметка» или <code>/note текст</code> — заметка "
-    "добавится в конец выбранной страницы вики свёрнутым блоком с датой в заголовке.\n\n"
+    "добавится в начало выбранной страницы вики свёрнутым блоком с датой в заголовке.\n\n"
     "/lists — мои списки\n/sections — разделы: добавить, убрать\n"
     "/note — заметка\n/notes_page — сменить страницу заметок\n"
     "/setup — сменить ключ\n/forget — удалить мои данные из бота"
@@ -369,12 +369,12 @@ class Handlers:
             p["await"], p["then"] = "notes_link", "note"
             return await m.answer(
                 "Куда складывать заметки? Пришлите ссылку на страницу вики (например, документ "
-                "«Заметки»): каждая заметка добавится в её конец свёрнутым блоком с датой. "
+                "«Заметки»): каждая заметка добавится в её начало свёрнутым блоком с датой. "
                 "/cancel — отмена")
         if p.get("note"):
             return await self.save_note(m, uid, p.pop("note"))
         p["await"] = "note_text"
-        await m.answer(f"Напишите заметку — добавлю её в конец «{html.escape(u.notes_title)}». "
+        await m.answer(f"Напишите заметку — добавлю её в начало «{html.escape(u.notes_title)}». "
                        "/cancel — отмена")
 
     async def set_notes_page(self, m: Message, uid: int, link: tuple[str, str]) -> None:
@@ -390,7 +390,7 @@ class Handlers:
         await self.st.set_notes(uid, doc["id"], title)
         p.pop("await", None)
         then = p.pop("then", None)
-        await m.answer(f"Заметки будут добавляться в конец «{html.escape(title)}» ✅", reply_markup=MAIN_KB)
+        await m.answer(f"Заметки будут добавляться в начало «{html.escape(title)}» ✅", reply_markup=MAIN_KB)
         if p.get("note"):
             await self.save_note(m, uid, p.pop("note"))
         elif then == "note":
@@ -406,7 +406,13 @@ class Handlers:
         oc = self.client(u)
         try:
             async with self.doc_locks[u.notes_id]:
-                doc = await oc.append_text(u.notes_id, nt.note_markdown(text, now))
+                md = nt.note_markdown(text, now)
+                old = (await oc.info(u.notes_id)).get("text") or ""
+                doc = await oc.prepend_text(u.notes_id, md)
+                if nt.looks_replaced(old, doc.get("text"), md):
+                    # старый Outline не знает editMode и заменил документ: возвращаем всё
+                    log.warning("Outline без editMode=prepend: восстанавливаю документ %s", u.notes_id)
+                    doc = await oc.update_text(u.notes_id, md + old)
         except OutlineError as e:
             log.info("note %s: %s", uid, e)
             if isinstance(e, NotFound):
