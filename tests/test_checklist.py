@@ -72,3 +72,12 @@ def test_links():
     assert parse_doc_link("https://wiki.example.com/doc/tE5hSY73Kc/edit", allowed)[1] == "tE5hSY73Kc"
     assert parse_doc_link("https://evil.example/doc/checklists-tE5hSY73Kc", allowed) is None
     assert API_KEY_RE.search("ключ ol_api_" + "a1B2" * 10)
+
+
+def test_note_markdown():
+    from datetime import datetime
+    from bot.notes import note_markdown, stamp
+    now = datetime(2026, 11, 10, 9, 5, 7)
+    assert stamp(now) == "2026.11.10 09:05:07"
+    md = note_markdown("строка\n+++\n  ++++  \nконец\n", now)
+    assert md == "\n\n+++\n## 2026.11.10 09:05:07\nстрока\n\\+++\n\\  ++++  \nконец\n+++\n"

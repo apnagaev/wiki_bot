@@ -36,6 +36,9 @@ def test_storage():
         assert (await st.get(5)).api_key == "ol_api_new"
         assert await st.remove_root(5, "r2") and not await st.remove_root(5, "r2")
         await st.set_hide(5, True); assert (await st.get(5)).hide_done
+        assert (await st.get(5)).notes_id == ""
+        await st.set_notes(5, "n1", "Заметки"); u = await st.get(5)
+        assert (u.notes_id, u.notes_title) == ("n1", "Заметки")
         assert await st.delete(5)
         assert await pool.fetchval("SELECT count(*) FROM checklist_roots") == 0   # каскад
         assert await Storage(pool, Fernet.generate_key().decode()).get(5) is None

@@ -6,15 +6,18 @@ import html
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-                           Message)
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from . import checklist as cl
+from . import notes as nt
 from .outline import (API_KEY_RE, AuthError, NotFound, Outline, OutlineError,
                       parse_doc_link)
 from .storage import MAX_ROOTS, Storage, User
@@ -26,10 +29,18 @@ MAX_CHILDREN = 30       # вложенных списков в меню
 BTN_LEN = 60            # Telegram обрезает длинные кнопки сам, но так аккуратнее
 
 
+LISTS_BTN = "📋 Списки"
+NOTE_BTN = "📝 Заметка"
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=LISTS_BTN), KeyboardButton(text=NOTE_BTN)]],
+    resize_keyboard=True, is_persistent=True)
+
+
 @dataclass
 class Config:
     wiki_urls: list[str]
     allowed_ids: set[int] = field(default_factory=set)
+    timezone: str = "Europe/Moscow"
 
 
 def _cut(s: str, n: int = BTN_LEN) -> str:
@@ -149,7 +160,10 @@ HELP = (
     "Бот видит в вики ровно то, что видите вы.\n\n"
     "Разделов может быть несколько (свои, семейные, рабочие): чтобы добавить ещё один, "
     "просто пришлите ссылку на него.\n\n"
+    "<b>Быстрые заметки</b>: кнопка «📝 Заметка» или <code>/note текст</code> — заметка "
+    "добавится в конец выбранной страницы вики свёрнутым блоком с датой в заголовке.\n\n"
     "/lists — мои списки\n/sections — разделы: добавить, убрать\n"
+    "/note — заметка\n/notes_page — сменить страницу заметок\n"
     "/setup — сменить ключ\n/forget — удалить мои данные из бота"
 )
 
@@ -162,8 +176,11 @@ def sections_view(u: User) -> tuple[str, InlineKeyboardMarkup]:
                                   callback_data=f"o|{r.id}|0")] for r in u.roots]
     rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="a")]
                 + ([InlineKeyboardButton(text="✖️ Убрать", callback_data="s")] if u.roots else []))
+    rows.append([InlineKeyboardButton(text=NOTE_BTN, callback_data="N")])
     text = "<b>Мои разделы</b>\n" + ("Выберите раздел" if u.roots else
                                      "Разделов нет. Пришлите ссылку на раздел чек-листов в вики.")
+    if u.notes_id:
+        text += f"\nЗаметки → «{html.escape(u.notes_title or 'Без названия')}»"
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -236,13 +253,17 @@ class Handlers:
         async def start(m: Message):
             if not self.allowed(m.from_user.id):
                 return await m.answer("Бот закрытый.")
+            self.pending.pop(m.from_user.id, None)
             u = await self.st.get(m.from_user.id)
-            if u and u.roots and m.text.startswith("/start"):
-                return await self.send_lists(m, u)
+            if u and m.text.startswith("/start"):
+                await m.answer("Кнопки «📋 Списки» и «📝 Заметка» — внизу.", reply_markup=MAIN_KB)
+                if u.roots:
+                    return await self.send_lists(m, u)
             await m.answer(HELP.format(example=self.example))
 
         @r.message(Command("lists"))
         async def lists(m: Message):
+            self.pending.get(m.from_user.id, {}).pop("await", None)
             u = await self.st.get(m.from_user.id)
             if not u:
                 return await m.answer(HELP.format(example=self.example))
@@ -255,6 +276,26 @@ class Handlers:
                 return await m.answer(HELP.format(example=self.example))
             text, kb = sections_view(u)
             await m.answer(text, reply_markup=kb)
+
+        @r.message(Command("note"))
+        async def note(m: Message, command: CommandObject):
+            await self.start_note(m, m.from_user.id, command.args)
+
+        @r.message(Command("notes_page"))
+        async def notes_page(m: Message):
+            u = await self.st.get(m.from_user.id)
+            if not u:
+                return await m.answer(HELP.format(example=self.example))
+            p = self.pending[m.from_user.id]
+            p.pop("note", None)
+            p["await"], p["then"] = "notes_link", None
+            cur = f"Сейчас заметки идут в «{html.escape(u.notes_title)}». " if u.notes_id else ""
+            await m.answer(cur + "Пришлите ссылку на страницу вики для заметок. /cancel — отмена")
+
+        @r.message(Command("cancel"))
+        async def cancel(m: Message):
+            self.pending.pop(m.from_user.id, None)
+            await m.answer("Отменено.", reply_markup=MAIN_KB)
 
         @r.message(Command("setup"))
         async def setup(m: Message):
@@ -278,8 +319,22 @@ class Handlers:
         if not self.allowed(uid):
             return await m.answer("Бот закрытый.")
         p = self.pending[uid]
+        if m.text == LISTS_BTN:
+            p.pop("await", None)
+            u = await self.st.get(uid)
+            return await (self.send_lists(m, u) if u else m.answer(HELP.format(example=self.example)))
+        if m.text == NOTE_BTN:
+            return await self.start_note(m, uid, None)
         km = API_KEY_RE.search(m.text)
         link = parse_doc_link(m.text, self.cfg.wiki_urls)
+        wait = p.get("await")
+        if wait == "note_text" and not km:          # ключ никогда не попадает в заметку
+            return await self.save_note(m, uid, m.text)
+        if wait == "notes_link" and not km:
+            if link:
+                return await self.set_notes_page(m, uid, link)
+            return await m.answer("Нужна ссылка на страницу вики, например "
+                                  f"<code>{self.example}/doc/zametki-…</code>. /cancel — отмена")
         if km:
             p["key"] = km.group(0)
             try:
@@ -295,6 +350,78 @@ class Handlers:
             self.pending.pop(uid, None)
             return await m.answer("Не понял. /lists — списки, /help — как подключить.")
         await self.try_setup(m, uid)
+
+    # ---------- заметки ----------
+
+    def now(self) -> datetime:
+        return datetime.now(ZoneInfo(self.cfg.timezone))
+
+    async def start_note(self, m: Message, uid: int, text: str | None) -> None:
+        if not self.allowed(uid):
+            return await m.answer("Бот закрытый.")
+        u = await self.st.get(uid)
+        if not u:
+            return await m.answer(HELP.format(example=self.example))
+        p = self.pending[uid]
+        if text and text.strip():
+            p["note"] = text
+        if not u.notes_id:
+            p["await"], p["then"] = "notes_link", "note"
+            return await m.answer(
+                "Куда складывать заметки? Пришлите ссылку на страницу вики (например, документ "
+                "«Заметки»): каждая заметка добавится в её конец свёрнутым блоком с датой. "
+                "/cancel — отмена")
+        if p.get("note"):
+            return await self.save_note(m, uid, p.pop("note"))
+        p["await"] = "note_text"
+        await m.answer(f"Напишите заметку — добавлю её в конец «{html.escape(u.notes_title)}». "
+                       "/cancel — отмена")
+
+    async def set_notes_page(self, m: Message, uid: int, link: tuple[str, str]) -> None:
+        u = await self.st.get(uid)
+        p = self.pending[uid]
+        if link[0] != u.wiki_url:
+            return await m.answer("Страница заметок должна быть в той же вики, что и разделы.")
+        try:
+            doc = await self.client(u).info(link[1])
+        except OutlineError as e:
+            return await m.answer(self.error_text(e))
+        title = doc.get("title") or ""
+        await self.st.set_notes(uid, doc["id"], title)
+        p.pop("await", None)
+        then = p.pop("then", None)
+        await m.answer(f"Заметки будут добавляться в конец «{html.escape(title)}» ✅", reply_markup=MAIN_KB)
+        if p.get("note"):
+            await self.save_note(m, uid, p.pop("note"))
+        elif then == "note":
+            p["await"] = "note_text"
+            await m.answer("Теперь напишите заметку. /cancel — отмена")
+
+    async def save_note(self, m: Message, uid: int, text: str) -> None:
+        u = await self.st.get(uid)
+        p = self.pending[uid]
+        if not text.strip():
+            return await m.answer("Пустая заметка. Напишите текст или /cancel.")
+        now = self.now()
+        oc = self.client(u)
+        try:
+            async with self.doc_locks[u.notes_id]:
+                doc = await oc.append_text(u.notes_id, nt.note_markdown(text, now))
+        except OutlineError as e:
+            log.info("note %s: %s", uid, e)
+            if isinstance(e, NotFound):
+                p["await"], p["then"], p["note"] = "notes_link", None, text
+                return await m.answer("Страница заметок недоступна (удалена или нет доступа). "
+                                      "Пришлите ссылку на новую — заметка сохранится туда. /cancel — отмена")
+            return await m.answer(self.error_text(e) + " Заметка не сохранена, текст выше — пришлите его ещё раз.")
+        p.pop("await", None)
+        title = doc.get("title") or u.notes_title
+        if title != u.notes_title:
+            await self.st.set_notes(uid, u.notes_id, title)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🌐 Открыть", url=oc.web_url(doc) if doc.get("url") else u.wiki_url),
+            InlineKeyboardButton(text="📝 Ещё заметка", callback_data="N")]])
+        await m.answer(f"📝 Сохранено в «{html.escape(title)}» · {nt.stamp(now)}", reply_markup=kb)
 
     async def try_setup(self, m: Message, uid: int) -> None:
         """Ссылка добавляет раздел, ключ заменяет ключ. Порядок любой."""
@@ -343,7 +470,7 @@ class Handlers:
                 notes.append(f"Раздел «{title}» уже был подключён")
         elif not old:
             notes.append("Ключ получен ✅. Теперь пришлите ссылку на раздел чек-листов.")
-        await m.answer(f"{html.escape(who)}: " + ". ".join(notes))
+        await m.answer(f"{html.escape(who)}: " + ". ".join(notes), reply_markup=MAIN_KB)
 
         u = await self.st.get(uid)
         if root:
@@ -384,6 +511,10 @@ class Handlers:
         if op == "m":
             await self.edit(cb, *sections_view(u))
             return await cb.answer()
+
+        if op == "N":
+            await cb.answer()
+            return await self.start_note(cb.message, u.tg_id, None)
 
         if op == "a":
             kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -468,7 +599,9 @@ async def set_commands(bot: Bot) -> None:
     from aiogram.types import BotCommand
     await bot.set_my_commands([
         BotCommand(command="lists", description="Мои списки"),
+        BotCommand(command="note", description="Быстрая заметка"),
         BotCommand(command="sections", description="Разделы: добавить, убрать"),
+        BotCommand(command="notes_page", description="Сменить страницу заметок"),
         BotCommand(command="setup", description="Сменить ключ API"),
         BotCommand(command="forget", description="Удалить мои данные"),
         BotCommand(command="help", description="Как подключить"),

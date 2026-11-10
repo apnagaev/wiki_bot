@@ -9,6 +9,7 @@ import os
 import pathlib
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import asyncpg
@@ -57,7 +58,9 @@ async def main() -> None:
     cfg = Config(
         wiki_urls=[u.strip().rstrip("/") for u in env("WIKI_URLS").split(",") if u.strip()],
         allowed_ids={int(x) for x in os.environ.get("ALLOWED_TG_IDS", "").replace(" ", "").split(",") if x},
+        timezone=os.environ.get("TIMEZONE") or "Europe/Moscow",
     )
+    ZoneInfo(cfg.timezone)   # опечатка в поясе — ошибка сразу при старте
     # подключение к базе — из стандартных переменных PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
     pool = await asyncpg.create_pool(min_size=1, max_size=5)
     storage = Storage(pool, env("SECRET_KEY"))

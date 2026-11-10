@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS checklist_users (
     wiki_user   TEXT NOT NULL DEFAULT '',
     api_key     BYTEA NOT NULL,
     hide_done   BOOLEAN NOT NULL DEFAULT FALSE,
+    notes_id    TEXT NOT NULL DEFAULT '',
+    notes_title TEXT NOT NULL DEFAULT '',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -39,6 +41,8 @@ BEGIN
     ALTER TABLE checklist_users DROP COLUMN root_id, DROP COLUMN IF EXISTS root_title;
   END IF;
 END $$;
+ALTER TABLE checklist_users ADD COLUMN IF NOT EXISTS notes_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE checklist_users ADD COLUMN IF NOT EXISTS notes_title TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -56,6 +60,8 @@ class User:
     api_key: str
     hide_done: bool
     roots: list[Root] = field(default_factory=list)
+    notes_id: str = ""
+    notes_title: str = ""
 
     def is_root(self, doc_id: str) -> bool:
         return any(r.id == doc_id for r in self.roots)
@@ -85,7 +91,8 @@ class Storage:
         roots = await self.pool.fetch(
             "SELECT root_id, title FROM checklist_roots WHERE tg_id=$1 ORDER BY added_at, title", tg_id)
         return User(r["tg_id"], r["wiki_url"], r["wiki_user"], key, r["hide_done"],
-                    [Root(x["root_id"], x["title"]) for x in roots])
+                    [Root(x["root_id"], x["title"]) for x in roots],
+                    r["notes_id"], r["notes_title"])
 
     async def save_user(self, tg_id: int, wiki_url: str, wiki_user: str, api_key: str) -> None:
         await self.pool.execute(
@@ -111,6 +118,11 @@ class Storage:
         res = await self.pool.execute(
             "DELETE FROM checklist_roots WHERE tg_id=$1 AND root_id=$2", tg_id, root_id)
         return res.endswith(" 1")
+
+    async def set_notes(self, tg_id: int, doc_id: str, title: str) -> None:
+        await self.pool.execute(
+            "UPDATE checklist_users SET notes_id=$2, notes_title=$3, updated_at=now() WHERE tg_id=$1",
+            tg_id, doc_id, title)
 
     async def set_hide(self, tg_id: int, hide: bool) -> None:
         await self.pool.execute(
