@@ -1,0 +1,17 @@
+- name: Ждём, пока контейнер станет healthy
+  ansible.builtin.command: docker inspect --format {% raw %}'{{.State.Health.Status}}'{% endraw %} checklistbot
+  register: chk_health
+  changed_when: false
+  retries: 30
+  delay: 3
+  until: chk_health.stdout == "healthy"
+
+- name: Роль узла (активный или резерв)
+  ansible.builtin.shell: docker logs --since 10m checklistbot 2>&1 | grep -E 'активный узел|резерв:' | tail -1
+  register: chk_role
+  changed_when: false
+  failed_when: false
+
+- name: Узел готов
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ chk_role.stdout | default('') or 'запущен' }}"

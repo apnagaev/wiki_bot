@@ -1,0 +1,97 @@
+# Telegram-бот чек-листов из вики Outline.
+# На каждом узле свой контейнер; Telegram опрашивает тот, кто держит advisory lock в PostgreSQL.
+- name: Чек-листы в Telegram
+  hosts: docker
+  become: true
+  serial: 1
+  vars:
+    checklistbot_dir: /docker-compose/checklistbot
+    checklistbot_telegram_token: ""
+    checklistbot_secret_key: ""
+    checklistbot_wiki_urls: []
+    checklistbot_allowed_tg_ids: []
+    checklistbot_telegram_proxy: ""
+    checklistbot_db_host: ""
+    checklistbot_db_port: 5432
+    checklistbot_db_name: checklistbot
+    checklistbot_db_user: checklistbot
+    checklistbot_db_password: ""
+    checklistbot_db_sslmode: prefer
+    checklistbot_dns: []
+    checklistbot_subnet: ""
+    checklistbot_log_level: INFO
+  vars_files:
+    - vars/checklistbot.yml
+  pre_tasks:
+    - name: Обязательные настройки заданы
+      ansible.builtin.assert:
+        that:
+          - checklistbot_telegram_token | length > 20
+          - checklistbot_secret_key | length == 44
+          - checklistbot_wiki_urls | length > 0
+          - checklistbot_db_host | length > 0
+          - checklistbot_db_password | length > 0
+        fail_msg: "проверьте vars/checklistbot.yml: токен бота, SECRET_KEY (44 символа), адрес вики, база"
+        quiet: true
+      run_once: true
+
+  tasks:
+    - name: Каталоги
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ checklistbot_dir }}"
+        - "{{ checklistbot_dir }}/app"
+
+    - name: Код бота
+      ansible.builtin.copy:
+        src: files/checklistbot/app/
+        dest: "{{ checklistbot_dir }}/app/"
+        owner: root
+        group: root
+        mode: preserve
+      register: chk_code
+
+    - name: docker-compose.yaml
+      ansible.builtin.template:
+        src: files/checklistbot/checklistbot.yaml.j2
+        dest: "{{ checklistbot_dir }}/docker-compose.yaml"
+        mode: "0644"
+
+    - name: Секреты (checklistbot.env)
+      ansible.builtin.template:
+        src: files/checklistbot/checklistbot.env.j2
+        dest: "{{ checklistbot_dir }}/checklistbot.env"
+        mode: "0600"
+      no_log: true
+
+    - name: Есть ли образ
+      ansible.builtin.command: docker image inspect checklistbot:local
+      register: chk_image
+      changed_when: false
+      failed_when: false
+
+    - name: Сборка образа (только при изменении кода или если образа нет)
+      ansible.builtin.command: docker compose build --pull
+      args:
+        chdir: "{{ checklistbot_dir }}"
+      when: chk_code.changed or chk_image.rc != 0
+
+    - name: Запуск (пересоздаётся, только если изменились образ или настройки)
+      ansible.builtin.command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ checklistbot_dir }}"
+      register: chk_up
+      changed_when: "'Recreate' in chk_up.stderr or 'Started' in chk_up.stderr or 'Created' in chk_up.stderr"
+
+    - name: Проверка
+      ansible.builtin.include_tasks: tasks/checklistbot-healthcheck.yaml
+
+    - name: Очистка неиспользуемых образов (тома не трогаем)
+      ansible.builtin.command: docker image prune -f
+      register: chk_prune
+      changed_when: "'Total reclaimed space: 0B' not in chk_prune.stdout"
