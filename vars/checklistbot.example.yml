@@ -15,6 +15,9 @@ checklistbot_allowed_tg_ids: []
 # если api.telegram.org недоступен напрямую: http://user:pass@proxy:3128 или socks5://…
 checklistbot_telegram_proxy: ""
 
+# часовой пояс для даты в заголовке заметок (гггг.мм.дд чч:мм:сс)
+checklistbot_timezone: Europe/Moscow
+
 # PostgreSQL
 checklistbot_db_host: db.example.com
 checklistbot_db_port: 5432

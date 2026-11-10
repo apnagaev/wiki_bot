@@ -20,6 +20,7 @@
     checklistbot_dns: []
     checklistbot_subnet: ""
     checklistbot_log_level: INFO
+    checklistbot_timezone: Europe/Moscow
   vars_files:
     - vars/checklistbot.yml
   pre_tasks:

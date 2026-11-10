@@ -84,6 +84,10 @@ class Outline:
     async def update_text(self, doc_id: str, text: str) -> dict:
         return (await self.call("documents.update", id=doc_id, text=text))["data"]
 
+    async def append_text(self, doc_id: str, text: str) -> dict:
+        """Добавить markdown в конец документа (сервер дописывает сам, без перезаписи)."""
+        return (await self.call("documents.update", id=doc_id, text=text, append=True))["data"]
+
     def web_url(self, doc: dict) -> str:
         url = doc.get("url") or ""
         return url if url.startswith("http") else self.base + url

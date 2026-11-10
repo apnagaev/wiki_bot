@@ -5,10 +5,13 @@
 """
 import asyncio, os, sys, pathlib, types
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "files/checklistbot/app"))
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import aiohttp, asyncpg
 from aiohttp import web
 from cryptography.fernet import Fernet
-from bot.handlers import Handlers, Config
+from bot.handlers import Handlers, Config, NOTE_BTN, LISTS_BTN
 from bot.storage import Storage
 from bot import checklist as cl
 
@@ -19,6 +22,7 @@ DOCS = {
     "trip-uuid": {"id": "trip-uuid", "urlId": "SMQWdQQqCa", "title": "Travel list", "parentDocumentId": "root-uuid", "url": "/doc/travel-list-SMQWdQQqCa",
                   "text": "# Всегда\n\n" + "\n".join(f"- [ ] вещь {i}" for i in range(8)) + "\n\n\\"},
     "fam-uuid": {"id": "fam-uuid", "urlId": "FaMiLy0001", "title": "Семья", "text": "- [ ] молоко", "parentDocumentId": None, "url": "/doc/semya-FaMiLy0001"},
+    "notes-uuid": {"id": "notes-uuid", "urlId": "NoTeS00001", "title": "Заметки", "text": "Мои заметки", "parentDocumentId": None, "url": "/doc/zametki-NoTeS00001"},
     "secret-uuid": {"id": "secret-uuid", "urlId": "SeCrEt0001", "title": "Чужое", "text": "", "parentDocumentId": None, "url": "/doc/x-SeCrEt0001", "deny": True},
 }
 UPDATES = []
@@ -44,7 +48,11 @@ async def api(req):
         kids = [dict(d) for d in DOCS.values() if d["parentDocumentId"] == body["parentDocumentId"]]
         return web.json_response({"data": kids})
     if m == "documents.update":
-        d = find(body["id"]); d["text"] = body["text"]; UPDATES.append(body["id"])
+        d = find(body["id"])
+        if d.get("deny"):
+            return web.json_response({}, status=404)
+        d["text"] = d["text"] + body["text"] if body.get("append") else body["text"]
+        UPDATES.append(body["id"])
         return web.json_response({"data": dict(d)})
     return web.json_response({}, status=400)
 
@@ -62,7 +70,8 @@ class Chat:
         toasts = []
         async def edit_text(t, reply_markup=None): s.edits.append((t, reply_markup))
         async def answer(t=None, show_alert=False): toasts.append(t)
-        return types.SimpleNamespace(data=data, message=types.SimpleNamespace(edit_text=edit_text),
+        async def send(t, reply_markup=None): s.out.append((t, reply_markup))
+        return types.SimpleNamespace(data=data, message=types.SimpleNamespace(edit_text=edit_text, answer=send),
                                      from_user=types.SimpleNamespace(id=1), answer=answer, toasts=toasts)
 
 
@@ -113,7 +122,7 @@ async def main():
 
         # несколько разделов: /lists — меню разделов
         u = await st.get(1); await h.send_lists(c.msg("/lists"), u)
-        assert labels(c.out[-1][1]) == ["📁 Checklists", "📁 Семья", "➕ Добавить", "✖️ Убрать"]
+        assert labels(c.out[-1][1]) == ["📁 Checklists", "📁 Семья", "➕ Добавить", "✖️ Убрать", NOTE_BTN]
 
         # список: параллельные отметки не теряются
         await h.on_callback(c.cb("o|SMQWdQQqCa|0"))
@@ -150,12 +159,51 @@ async def main():
         await h.on_callback(c.cb("s")); await h.on_callback(c.cb("d|fam-uuid"))
         assert "Семья и дача" in c.edits[-1][0]
         cb = c.cb("D|fam-uuid"); await h.on_callback(cb)
-        assert labels(c.edits[-1][1]) == ["📁 Checklists", "➕ Добавить", "✖️ Убрать"] and cb.toasts[-1] == "Раздел убран"
+        assert labels(c.edits[-1][1]) == ["📁 Checklists", "➕ Добавить", "✖️ Убрать", NOTE_BTN] and cb.toasts[-1] == "Раздел убран"
         assert "Семья" in DOCS["fam-uuid"]["title"]          # в вики ничего не тронуто
 
         # смена ключа: разделы остаются
         await h.on_text(c.msg(KEY))
         assert "Ключ обновлён" in c.out[-2][0] and len((await st.get(1)).roots) == 1
+
+        # заметки: страницы ещё нет — бот спрашивает ссылку, потом текст
+        await h.on_text(c.msg(NOTE_BTN))
+        assert "Куда складывать заметки" in c.out[-1][0]
+        await h.on_text(c.msg("просто текст"))                      # не ссылка — переспросит
+        assert "Нужна ссылка" in c.out[-1][0]
+        await h.on_text(c.msg(f"{BASE}/doc/zametki-NoTeS00001"))
+        assert "в конец «Заметки»" in c.out[-2][0] and "напишите заметку" in c.out[-1][0]
+        before = datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0)
+        await h.on_text(c.msg(f"Купить молоко\n+++\nи хлеб {BASE}/doc/x-SeCrEt0001"))   # ссылка внутри — это текст заметки
+        t = DOCS["notes-uuid"]["text"]
+        m = re.search(r"\n\n\+\+\+\n## (\d{4}\.\d\d\.\d\d \d\d:\d\d:\d\d)\nКупить молоко\n\\\+\+\+\nи хлеб .*\n\+\+\+\n$", t)
+        assert m, t
+        stamp = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S").replace(tzinfo=ZoneInfo("Europe/Moscow"))
+        assert 0 <= (stamp - before).total_seconds() < 5            # время московское
+        assert t.startswith("Мои заметки") and c.out[-1][0].startswith("📝 Сохранено в «Заметки»")
+        assert len((await st.get(1)).roots) == 1                     # ссылка не стала разделом
+        # /note текст — сразу, без вопросов; кнопка «Ещё заметка»
+        await h.start_note(c.msg("/note"), 1, "вторая")
+        assert DOCS["notes-uuid"]["text"].endswith("\nвторая\n+++\n")
+        await h.on_callback(c.cb("N")); assert "Напишите заметку" in c.out[-1][0]
+        # ключ во время ожидания заметки — не попадает в заметку
+        n = len(DOCS["notes-uuid"]["text"])
+        await h.on_text(c.msg(KEY))
+        assert len(DOCS["notes-uuid"]["text"]) == n and "Ключ обновлён" in c.out[-2][0]
+        # меню разделов показывает страницу заметок
+        await h.on_callback(c.cb("m")); assert "Заметки → «Заметки»" in c.edits[-1][0]
+        # страница заметок пропала — бот просит новую и сохраняет туда же текст
+        DOCS["notes-uuid"]["deny"] = True
+        await h.start_note(c.msg("/note"), 1, "потерянная")
+        assert "недоступна" in c.out[-1][0]
+        DOCS["fam-uuid"]["text"] = "Семейное"
+        await h.on_text(c.msg(f"{BASE}/doc/semya-FaMiLy0001"))
+        assert DOCS["fam-uuid"]["text"].endswith("\npotерянная\n+++\n".replace("potерянная", "потерянная"))
+        assert (await st.get(1)).notes_title == "Семья и дача"
+        # /cancel
+        await h.on_text(c.msg(NOTE_BTN)); h.pending.pop(1, None)
+        await h.on_text(c.msg("что-то"))
+        assert "Не понял" in c.out[-1][0]
 
         # плохой ключ в базе
         await pool.execute("UPDATE checklist_users SET api_key=$1", st.f.encrypt(b"ol_api_bad"))
